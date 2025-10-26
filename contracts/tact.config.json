@@ -1,0 +1,9 @@
+{
+  "projects": [
+    {
+      "name": "SubscriptionFactory",
+      "path": "./contracts/factory.tact",
+      "output": "./build"
+    }
+  ]
+}

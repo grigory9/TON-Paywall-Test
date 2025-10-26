@@ -1,0 +1,347 @@
+import "@stdlib/deploy";
+import "@stdlib/ownable";
+
+// LEGACY: Deploy message for backward compatibility (binary message)
+message DeploySubscription {
+    queryId: Int as uint64;
+    channelId: Int as int64;
+    adminWallet: Address;
+    monthlyPrice: Int as coins;
+}
+
+// NEW: Pre-register deployment parameters (owner-only operation)
+message RegisterDeployment {
+    userWallet: Address;      // Who will pay for deployment
+    channelId: Int as int64;
+    monthlyPrice: Int as coins;
+}
+
+message UpdateFactoryFee {
+    newFee: Int as coins;
+}
+
+// Response message after deployment
+message SubscriptionDeployed {
+    channelId: Int as int64;
+    contractAddress: Address;
+}
+
+// Message for updating subscription price
+message UpdatePrice {
+    newPrice: Int as coins;
+}
+
+// Message for updating admin wallet
+message UpdateAdminWallet {
+    newWallet: Address;
+}
+
+// NEW: Storage for pre-registered deployment parameters
+struct RegisteredParams {
+    channelId: Int as int64;
+    monthlyPrice: Int as coins;
+    registeredAt: Int as uint32; // Timestamp for expiry check
+}
+
+// Main factory contract for deploying channel subscriptions
+contract SubscriptionFactory with Deployable, Ownable {
+    owner: Address;
+    deploymentFee: Int as coins = ton("0.1"); // Fee for deploying new subscription
+    deployedContracts: map<Int, Address>; // channelId -> contract address
+
+    // NEW: Pre-registered deployment parameters
+    // Key: hash(userWallet address) -> Value: deployment params
+    registeredDeployments: map<Int, RegisteredParams>;
+
+    totalDeployed: Int as uint32 = 0;
+
+    init(owner: Address) {
+        self.owner = owner;
+    }
+
+    // NEW: Backend calls this to pre-register deployment BEFORE user pays
+    // This is a trusted owner-only operation, costs ~0.01 TON gas
+    receive(msg: RegisterDeployment) {
+        let ctx: Context = context();
+
+        // Only owner (backend) can register deployments
+        self.requireOwner();
+
+        // Create hash key from user wallet address
+        let walletHash: Int = msg.userWallet.asSlice().hash();
+
+        // Store parameters for later use
+        self.registeredDeployments.set(walletHash, RegisteredParams{
+            channelId: msg.channelId,
+            monthlyPrice: msg.monthlyPrice,
+            registeredAt: now()
+        });
+
+        // Emit event for backend logging
+        emit("DeploymentRegistered".asComment());
+    }
+
+    // NEW: Autonomous deployment handler using text comment
+    // User sends "deploy" text comment with 0.7 TON
+    // Factory looks up pre-registered params and deploys automatically
+    // NO backend intervention needed!
+    receive("deploy") {
+        let ctx: Context = context();
+
+        // Check minimum deposit amount
+        require(ctx.value >= self.deploymentFee + ton("0.5"), "Insufficient fee: send at least 0.6 TON");
+
+        // Look up pre-registered parameters using sender's address hash
+        let senderHash: Int = ctx.sender.asSlice().hash();
+        let params: RegisteredParams? = self.registeredDeployments.get(senderHash);
+
+        require(params != null, "Deployment not registered. Contact admin bot to setup channel first.");
+
+        let deployParams: RegisteredParams = params!!;
+
+        // Check registration isn't too old (expire after 1 hour = 3600 seconds)
+        require(now() - deployParams.registeredAt < 3600, "Registration expired. Please start channel setup again.");
+
+        // Check if already deployed for this channel
+        require(self.deployedContracts.get(deployParams.channelId) == null, "Already deployed for this channel");
+
+        // Calculate init state for new contract
+        let initCode: StateInit = initOf ChannelSubscription(
+            myAddress(),
+            deployParams.channelId,
+            ctx.sender, // User wallet becomes admin
+            deployParams.monthlyPrice
+        );
+
+        // Deploy new subscription contract
+        let subscriptionAddress: Address = contractAddress(initCode);
+
+        // Store deployed contract address
+        self.deployedContracts.set(deployParams.channelId, subscriptionAddress);
+        self.totalDeployed = self.totalDeployed + 1;
+
+        // Clean up registration (prevent re-use and save storage)
+        self.registeredDeployments.set(senderHash, null);
+
+        // Send remaining balance to initialize the subscription contract
+        send(SendParameters{
+            to: subscriptionAddress,
+            value: ctx.value - self.deploymentFee,
+            mode: SendIgnoreErrors,
+            code: initCode.code,
+            data: initCode.data,
+            body: beginCell().endCell()
+        });
+
+        // Notify user about successful deployment
+        send(SendParameters{
+            to: ctx.sender,
+            value: ton("0.01"),
+            mode: SendIgnoreErrors,
+            body: SubscriptionDeployed{
+                channelId: deployParams.channelId,
+                contractAddress: subscriptionAddress
+            }.toCell()
+        });
+    }
+
+    // LEGACY: Binary message handler for backward compatibility
+    // Kept for direct backend deployments if needed
+    receive(msg: DeploySubscription) {
+        let ctx: Context = context();
+
+        // Check deployment fee
+        require(ctx.value >= self.deploymentFee + ton("0.5"), "Insufficient fee");
+
+        // Check if already deployed for this channel
+        require(self.deployedContracts.get(msg.channelId) == null, "Already deployed");
+
+        // Calculate init state for new contract
+        let initCode: StateInit = initOf ChannelSubscription(
+            myAddress(),
+            msg.channelId,
+            msg.adminWallet,
+            msg.monthlyPrice
+        );
+
+        // Deploy new subscription contract
+        let subscriptionAddress: Address = contractAddress(initCode);
+
+        // Store deployed contract address
+        self.deployedContracts.set(msg.channelId, subscriptionAddress);
+        self.totalDeployed = self.totalDeployed + 1;
+
+        // Send remaining balance to initialize the subscription contract
+        send(SendParameters{
+            to: subscriptionAddress,
+            value: ctx.value - self.deploymentFee,
+            mode: SendIgnoreErrors,
+            code: initCode.code,
+            data: initCode.data,
+            body: beginCell().endCell()
+        });
+
+        // Send confirmation back to sender
+        send(SendParameters{
+            to: ctx.sender,
+            value: 0,
+            mode: SendRemainingValue,
+            body: SubscriptionDeployed{
+                channelId: msg.channelId,
+                contractAddress: subscriptionAddress
+            }.toCell()
+        });
+    }
+
+    // Update deployment fee (owner only)
+    receive(msg: UpdateFactoryFee) {
+        self.requireOwner();
+        self.deploymentFee = msg.newFee;
+    }
+
+    // Get subscription contract address for channel
+    get fun getSubscriptionAddress(channelId: Int): Address? {
+        return self.deployedContracts.get(channelId);
+    }
+
+    // Get deployment fee
+    get fun getDeploymentFee(): Int {
+        return self.deploymentFee;
+    }
+
+    // Get total deployed contracts count
+    get fun getTotalDeployed(): Int {
+        return self.totalDeployed;
+    }
+
+    // NEW: Get registered deployment params for a user (for verification)
+    get fun getRegisteredDeployment(userWallet: Address): RegisteredParams? {
+        let walletHash: Int = userWallet.asSlice().hash();
+        return self.registeredDeployments.get(walletHash);
+    }
+}
+
+// Individual channel subscription contract
+contract ChannelSubscription with Deployable {
+    factoryAddress: Address;
+    channelId: Int as int64; // Changed to int64 to support negative Telegram channel IDs
+    adminWallet: Address;
+    monthlyPrice: Int as coins;
+
+    subscribers: map<Address, Int as uint32>; // wallet -> expiry timestamp
+    totalSubscribers: Int as uint32 = 0;
+    totalRevenue: Int as coins = 0;
+    tolerancePercent: Int as uint8 = 1; // 1% underpayment tolerance
+
+    init(factory: Address, channel: Int, admin: Address, price: Int) {
+        self.factoryAddress = factory;
+        self.channelId = channel;
+        self.adminWallet = admin;
+        self.monthlyPrice = price;
+    }
+
+    // Process subscription payment
+    receive("Subscribe") {
+        let ctx: Context = context();
+        let subscriber: Address = ctx.sender;
+
+        // Calculate minimum acceptable payment (1% tolerance)
+        // Use proper order of operations to avoid rounding issues
+        let minPayment: Int = (self.monthlyPrice * 99) / 100;
+        require(ctx.value >= minPayment, "Insufficient payment");
+
+        // Calculate subscription expiry (30 days from now or extend existing)
+        let currentExpiry: Int? = self.subscribers.get(subscriber);
+        let newExpiry: Int = 0;
+
+        if (currentExpiry != null && currentExpiry!! > now()) {
+            // Extend existing subscription
+            newExpiry = currentExpiry!! + (30 * 24 * 60 * 60);
+        } else {
+            // New subscription or expired
+            newExpiry = now() + (30 * 24 * 60 * 60);
+            if (currentExpiry == null) {
+                self.totalSubscribers = self.totalSubscribers + 1;
+            }
+        }
+
+        // Update subscription
+        self.subscribers.set(subscriber, newExpiry);
+        // Track actual amount received for accurate revenue accounting
+        self.totalRevenue = self.totalRevenue + ctx.value;
+
+        // Send payment to admin wallet instantly (minus gas)
+        // Reduced gas reservation from 0.05 to 0.02 TON (actual cost ~0.01 TON)
+        let adminPayment: Int = self.monthlyPrice - ton("0.02");
+        send(SendParameters{
+            to: self.adminWallet,
+            value: adminPayment,
+            mode: SendIgnoreErrors,
+            body: "Subscription payment".asComment()
+        });
+
+        // Handle overpayment refund
+        // Lower threshold from 0.1 to 0.01 TON to refund smaller overpayments
+        let overpayment: Int = ctx.value - self.monthlyPrice;
+        if (overpayment > ton("0.01")) {
+            // Refund overpayment minus gas for the refund transaction
+            send(SendParameters{
+                to: subscriber,
+                value: overpayment - ton("0.005"), // Minimal gas for refund
+                mode: SendIgnoreErrors,
+                body: "Overpayment refund".asComment()
+            });
+        }
+    }
+
+    // Admin can update price
+    receive(msg: UpdatePrice) {
+        let ctx: Context = context();
+        require(ctx.sender == self.adminWallet, "Admin only");
+        require(msg.newPrice > 0, "Invalid price");
+        require(msg.newPrice <= ton("1000"), "Price too high"); // Max 1000 TON
+        self.monthlyPrice = msg.newPrice;
+    }
+
+    // Admin can change wallet
+    receive(msg: UpdateAdminWallet) {
+        let ctx: Context = context();
+        require(ctx.sender == self.adminWallet, "Admin only");
+        self.adminWallet = msg.newWallet;
+    }
+
+    // Check if user has active subscription
+    get fun isActive(subscriber: Address): Bool {
+        let expiry: Int? = self.subscribers.get(subscriber);
+        return expiry != null && expiry!! > now();
+    }
+
+    // Get subscription expiry timestamp
+    get fun getExpiry(subscriber: Address): Int {
+        let expiry: Int? = self.subscribers.get(subscriber);
+        if (expiry == null) {
+            return 0;
+        }
+        return expiry!!;
+    }
+
+    // Get total subscribers count
+    get fun getTotalSubscribers(): Int {
+        return self.totalSubscribers;
+    }
+
+    // Get total revenue
+    get fun getTotalRevenue(): Int {
+        return self.totalRevenue;
+    }
+
+    // Get monthly price
+    get fun getMonthlyPrice(): Int {
+        return self.monthlyPrice;
+    }
+
+    // Get channel ID
+    get fun getChannelId(): Int {
+        return self.channelId;
+    }
+}

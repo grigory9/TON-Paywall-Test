@@ -1,0 +1,158 @@
+================================================================================
+TON PAYWALL - DATABASE SETUP STEPS (Fresh Debian)
+================================================================================
+
+Your user 'gmet' is not in sudoers file. Follow these steps:
+
+--------------------------------------------------------------------------------
+STEP 1: Login as Root
+--------------------------------------------------------------------------------
+
+In your terminal:
+
+    su -
+
+Enter the root password when prompted.
+
+--------------------------------------------------------------------------------
+STEP 2: Add Your User to Sudo Group (RECOMMENDED)
+--------------------------------------------------------------------------------
+
+Run this command as root:
+
+    usermod -aG sudo gmet
+
+Verify:
+
+    groups gmet
+
+Should show: gmet : gmet sudo ...
+
+Then logout and login again:
+
+    exit        # Exit root
+    exit        # Logout from current session
+    # Login again as gmet
+
+Then test sudo:
+
+    sudo whoami
+
+Should output: root
+
+Now you can run the regular setup:
+
+    cd /home/gmet/workspace/ton-paywall
+    ./setup-database.sh
+
+--------------------------------------------------------------------------------
+STEP 2 (Alternative): Setup Database as Root Without Sudo
+--------------------------------------------------------------------------------
+
+If you can't logout/login, stay as root and run:
+
+    cd /home/gmet/workspace/ton-paywall
+    ./setup-database-root.sh
+
+This will:
+- Create database user 'tonpaywall'
+- Create database 'ton_subscription_mvp'
+- Apply schema (create 7 tables)
+- Update .env file
+- Set correct file permissions
+
+Then exit root:
+
+    exit
+
+--------------------------------------------------------------------------------
+STEP 3: Verify Database Connection (as user gmet)
+--------------------------------------------------------------------------------
+
+After setup, test the connection:
+
+    cd /home/gmet/workspace/ton-paywall
+
+    # Check .env file
+    cat .env | grep DATABASE_URL
+
+    # Test connection (use password from .env)
+    PGPASSWORD='your_password' psql -h localhost -p 5433 -U tonpaywall -d ton_subscription_mvp -c "\dt"
+
+You should see 7 tables:
+- admins
+- analytics_summary
+- channels
+- payments
+- setup_progress
+- subscribers
+- subscriptions
+
+--------------------------------------------------------------------------------
+STEP 4: Continue with Project Setup
+--------------------------------------------------------------------------------
+
+1. Install dependencies:
+    npm install
+
+2. Deploy smart contracts:
+    cd contracts
+    npm install
+    npm run build
+    npm run deploy:testnet
+    # Save factory address to .env
+
+3. Configure .env:
+    nano .env
+    # Add bot tokens and factory address
+
+4. Start bots:
+    # Terminal 1
+    cd admin-bot && npm install && npm run dev
+
+    # Terminal 2
+    cd payment-bot && npm install && npm run dev
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+If PostgreSQL is not running:
+    su -
+    systemctl start postgresql
+    systemctl enable postgresql
+    exit
+
+Check PostgreSQL port:
+    su -
+    pg_lsclusters
+    exit
+
+If you see port 5432 instead of 5433, update DATABASE_URL in .env:
+    DATABASE_URL=postgresql://tonpaywall:password@localhost:5432/ton_subscription_mvp
+
+For detailed help:
+    cat docs/DEBIAN_SETUP.md
+
+================================================================================
+QUICK SUMMARY
+================================================================================
+
+As root:
+    su -
+    usermod -aG sudo gmet          # Add to sudoers
+    exit
+    exit                            # Logout and login again
+
+OR run database setup as root:
+    su -
+    cd /home/gmet/workspace/ton-paywall
+    ./setup-database-root.sh
+    exit
+
+Then as gmet:
+    cd /home/gmet/workspace/ton-paywall
+    # Verify database works
+    # Continue with npm install and project setup
+
+================================================================================

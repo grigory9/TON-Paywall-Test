@@ -1,0 +1,24 @@
+{
+  "name": "ton-subscription-paywall",
+  "version": "1.0.0",
+  "description": "TON-based subscription paywall system for Telegram channels",
+  "private": true,
+  "workspaces": [
+    "contracts",
+    "admin-bot",
+    "payment-bot"
+  ],
+  "scripts": {
+    "install:all": "npm install && npm install --workspaces",
+    "build": "npm run build --workspaces",
+    "deploy:contracts": "cd contracts && npm run deploy",
+    "start:admin": "cd admin-bot && npm start",
+    "start:payment": "cd payment-bot && npm start",
+    "dev:admin": "cd admin-bot && npm run dev",
+    "dev:payment": "cd payment-bot && npm run dev",
+    "test": "npm test --workspaces"
+  },
+  "keywords": ["ton", "telegram", "subscription", "paywall", "blockchain"],
+  "author": "",
+  "license": "MIT"
+}
