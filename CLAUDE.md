@@ -194,7 +194,19 @@ Payment bot runs background monitoring:
 - Checks pending subscriptions every 30 seconds
 - Verifies blockchain transactions
 - Automatically activates subscriptions when payment confirmed
-- Updates database and notifies users
+- Sends automatic notification to users when subscription activates
+- Updates database with transaction hash and payment details
+
+### TON Connect Integration
+Both bots support TON Connect for wallet connections:
+- **Payment Bot**: Users connect wallet to pay for subscriptions
+- **Admin Bot**: Channel owners connect wallet for contract deployment
+- Manifest URLs configured separately:
+  - Admin: `TONCONNECT_MANIFEST_URL` → `ton-paywall-admin-manifest.json`
+  - Payment: `TONCONNECT_MANIFEST_URL` → `ton-paywall-client-manifest.json`
+- Sessions stored in PostgreSQL (separate tables for admins/subscribers)
+- QR codes for desktop, deep links for mobile
+- Supports Telegram Wallet, Tonkeeper, MyTonWallet, Tonhub, etc.
 
 ## Smart Contract Development
 

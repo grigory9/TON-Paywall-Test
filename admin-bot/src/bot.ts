@@ -50,6 +50,7 @@ export class AdminBot {
     // Setup command handlers
     this.setupCommands();
     this.setupCallbacks();
+    this.setupChatMemberHandler();
 
     // Error handling
     this.bot.catch((err) => {
@@ -96,6 +97,38 @@ export class AdminBot {
       await ctx.conversation.enter('setupChannelConversation');
     });
 
+    // Get channel ID helper command
+    this.bot.command('getchannelid', async (ctx) => {
+      await ctx.reply(
+        '📋 To get your channel ID:\n\n' +
+        '**Method 1 (Easiest):**\n' +
+        '1. Add @getidsbot to your channel\n' +
+        '2. It will send you the channel ID\n' +
+        '3. Copy the number (e.g., `-1001234567890`)\n\n' +
+        '**Method 2:**\n' +
+        '1. Add @username_to_id_bot to your channel\n' +
+        '2. Copy the ID it sends\n\n' +
+        '**Then use /setup and paste the ID when asked!**',
+        { parse_mode: 'Markdown' }
+      );
+    });
+
+    // Command to get current chat ID (works in channels too)
+    this.bot.command('id', async (ctx) => {
+      const chatId = ctx.chat.id;
+      const chatType = ctx.chat.type;
+      const chatTitle = 'title' in ctx.chat ? ctx.chat.title : 'Private Chat';
+
+      await ctx.reply(
+        `✅ *Chat Information*\n\n` +
+        `📋 *Chat ID:* \`${chatId}\`\n` +
+        `📝 *Name:* ${chatTitle}\n` +
+        `🔖 *Type:* ${chatType}\n\n` +
+        `_Copy the Chat ID and use it in /setup_`,
+        { parse_mode: 'Markdown' }
+      );
+    });
+
     // Channels command - list managed channels
     this.bot.command('channels', async (ctx) => {
       const userId = ctx.from?.id;
@@ -119,7 +152,8 @@ export class AdminBot {
       for (const channel of channels) {
         const status = channel.is_active ? '✅ Active' : '⚠️ Setup Incomplete';
         message += `${status} ${channel.title}\n`;
-        message += `├ Monthly Price: ${channel.monthly_price_ton} TON\n`;
+        message += `├ Access Price: ${channel.access_price_ton} TON (one-time)\n`;
+        message += `├ Type: ${channel.channel_type || 'private'}\n`;
         message += `├ Contract: ${channel.subscription_contract_address ? 'Deployed' : 'Not deployed'}\n`;
         message += `└ ID: ${channel.telegram_id}\n\n`;
       }
@@ -183,6 +217,46 @@ export class AdminBot {
     });
   }
 
+  private setupChatMemberHandler() {
+    // Detect when bot is added to a channel/group
+    this.bot.on('my_chat_member', async (ctx) => {
+      const update = ctx.myChatMember;
+      const chat = update.chat;
+      const newStatus = update.new_chat_member.status;
+      const oldStatus = update.old_chat_member.status;
+
+      // Check if bot was just added as admin
+      if ((oldStatus === 'left' || oldStatus === 'kicked') &&
+          (newStatus === 'administrator' || newStatus === 'member')) {
+
+        // Only respond to channels and supergroups
+        if (chat.type === 'channel' || chat.type === 'supergroup') {
+          try {
+            // Send channel ID directly to the chat
+            await ctx.api.sendMessage(
+              chat.id,
+              `✅ *Admin Bot Added Successfully!*\n\n` +
+              `📋 *Channel ID:* \`${chat.id}\`\n\n` +
+              `*Channel Name:* ${chat.title}\n` +
+              `*Type:* ${chat.type === 'channel' ? 'Channel' : 'Supergroup'}\n\n` +
+              `*Next Steps:*\n` +
+              `1\\. Copy the channel ID above\n` +
+              `2\\. Open chat with @PaywallAdmin\\_bot\n` +
+              `3\\. Type /setup\n` +
+              `4\\. Paste the channel ID when asked\n\n` +
+              `_You can delete this message after copying the ID\\._`,
+              { parse_mode: 'MarkdownV2' }
+            );
+
+            console.log(`✅ Bot added to channel: ${chat.title} (ID: ${chat.id})`);
+          } catch (error) {
+            console.error('Error sending channel ID:', error);
+          }
+        }
+      }
+    });
+  }
+
   private setupCallbacks() {
     // Setup channel callback
     this.bot.callbackQuery('setup_channel', async (ctx) => {
@@ -207,7 +281,7 @@ export class AdminBot {
     // Update price callback
     this.bot.callbackQuery(/^update_price_(\d+)$/, async (ctx) => {
       await ctx.answerCallbackQuery();
-      await ctx.reply('💎 Enter new monthly price in TON:');
+      await ctx.reply('💎 Enter new one-time access price in TON:\n\n(This is lifetime access - users pay once)');
       // Handle price update in message handler
     });
   }
@@ -217,7 +291,15 @@ export class AdminBot {
     // Step 1: Get channel username or ID
     await ctx.reply(
       '🚀 Let\'s setup subscription for your channel!\n\n' +
-      'Please forward a message from your channel or enter the channel username (e.g., @yourchannel):'
+      '**For PRIVATE channels:**\n' +
+      'Send the channel ID (e.g., `-1001234567890`)\n\n' +
+      '**For PUBLIC channels:**\n' +
+      'Send the channel username (e.g., `@yourchannel`)\n\n' +
+      '**How to get channel ID:**\n' +
+      '1. Add @getidsbot to your channel\n' +
+      '2. It will send you the channel ID\n' +
+      '3. Copy and paste it here',
+      { parse_mode: 'Markdown' }
     );
 
     const channelResponse = await conversation.wait();
@@ -236,12 +318,55 @@ export class AdminBot {
         return;
       }
     } else if (channelResponse.message?.text) {
-      // Channel username provided
-      channelId = channelResponse.message.text.trim();
+      // Channel username or ID provided
+      let input = channelResponse.message.text.trim();
+
+      // Check if it's a channel ID (negative number)
+      if (input.startsWith('-')) {
+        // It's a channel ID - parse it
+        let rawId = parseInt(input);
+        if (isNaN(rawId)) {
+          await ctx.reply('❌ Invalid channel ID format. It should be a negative number.');
+          return;
+        }
+
+        // Convert to Bot API format if needed
+        // Telegram Desktop/Web shows IDs like -3298620277
+        // Bot API needs format like -1001234567890
+        if (input.startsWith('-100')) {
+          // Already in correct format
+          channelId = rawId;
+        } else {
+          // Convert to -100 format
+          // Remove the minus sign, then prepend -100
+          const idWithoutMinus = Math.abs(rawId).toString();
+          channelId = parseInt(`-100${idWithoutMinus}`);
+
+          console.log(`Converted channel ID from ${rawId} to ${channelId}`);
+          await ctx.reply(
+            `📝 Converting channel ID format...\n\n` +
+            `Original: \`${rawId}\`\n` +
+            `Converted: \`${channelId}\`\n\n` +
+            `Using converted format for Bot API.`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+      } else {
+        // It's a username
+        channelId = input;
+      }
+
       try {
         channelInfo = await this.bot.api.getChat(channelId);
       } catch (error) {
-        await ctx.reply('❌ Channel not found. Please check the username and try again.');
+        await ctx.reply(
+          '❌ Channel not found.\n\n' +
+          'Please make sure:\n' +
+          '1. The channel ID/username is correct\n' +
+          '2. The bot has been added as an admin to the channel\n' +
+          '3. The bot has permission to view channel info'
+        );
+        console.error('Error fetching channel:', error);
         return;
       }
     } else {
@@ -249,10 +374,28 @@ export class AdminBot {
       return;
     }
 
-    // Step 2: Skip admin rights verification for MVP
-    // Note: In production, you should verify the user is actually a channel admin
+    // Step 2: Verify channel is PRIVATE (required for join requests)
+    // Note: In production, you should also verify the user is actually a channel admin
+    const channelType = channelInfo.type;
+
+    // Telegram channel types: 'private' for private channels/supergroups, 'channel' for public channels
+    // Private channels will have no username
+    const isPrivate = !channelInfo.username || channelType === 'private' || channelType === 'supergroup';
+
+    if (!isPrivate) {
+      await ctx.reply(
+        '❌ Public channels are not supported.\n\n' +
+        'Our paywall system requires PRIVATE channels to control access via join requests.\n\n' +
+        'Please:\n' +
+        '1. Convert your channel to private in channel settings\n' +
+        '2. Come back and run /setup again\n\n' +
+        'Why? Public channels allow anyone to join without approval, making paid access impossible.'
+      );
+      return;
+    }
+
     await ctx.reply(
-      '✅ Channel detected: ' + channelInfo.title + '\n\n' +
+      '✅ Private channel detected: ' + channelInfo.title + '\n\n' +
       '⚠️ Important: Make sure you are an admin of this channel with full permissions.'
     );
 
@@ -270,14 +413,48 @@ export class AdminBot {
       admin.id
     );
 
+    // Mark as private channel with join request approval
+    await this.database.updateChannel(channel.id, {
+      channel_type: 'private',
+      requires_approval: true
+    });
+
     ctx.session.currentChannelId = channel.id;
 
-    // Step 4: Add payment bot to channel
+    // Step 4: Create invite link with join request approval
+    await ctx.reply('🔗 Creating invite link for your private channel...');
+
+    try {
+      const inviteLink = await this.bot.api.createChatInviteLink(channelInfo.id, {
+        creates_join_request: true,
+        name: 'Premium Access Link'
+      });
+
+      await this.database.updateChannel(channel.id, {
+        invite_link: inviteLink.invite_link
+      });
+
+      await ctx.reply(
+        '✅ Invite link created with join request approval!\n\n' +
+        'When users try to join, they will need to pay first.'
+      );
+    } catch (inviteLinkError) {
+      console.error('Failed to create invite link:', inviteLinkError);
+      await ctx.reply(
+        '⚠️ Could not auto-create invite link. You can create it manually:\n\n' +
+        '1. Go to channel settings\n' +
+        '2. Create new invite link\n' +
+        '3. Enable "Request Admin Approval"\n\n' +
+        'Continuing setup...'
+      );
+    }
+
+    // Step 5: Add payment bot to channel
     await ctx.reply(
       '📌 Now, add our payment bot to your channel:\n\n' +
       '1. Go to your channel\n' +
       `2. Add @${process.env.PAYMENT_BOT_USERNAME} as admin\n` +
-      '3. Grant "Post Messages" and "Edit Messages" permissions\n' +
+      '3. Grant "Invite Users via Link" permission (required for join requests)\n' +
       '4. Click "Confirm" when done',
       {
         reply_markup: {
@@ -301,7 +478,7 @@ export class AdminBot {
     await this.database.updateChannel(channel.id, { payment_bot_added: true });
     await ctx.reply(
       '✅ Assuming payment bot was added.\n\n' +
-      '⚠️ Make sure @' + process.env.PAYMENT_BOT_USERNAME + ' is added as admin with post/edit permissions!'
+      '⚠️ Make sure @' + process.env.PAYMENT_BOT_USERNAME + ' is added as admin with "Invite Users via Link" permission!'
     );
 
     // Step 5: Connect wallet via TON Connect
@@ -443,13 +620,16 @@ export class AdminBot {
       return;
     }
 
-    // Step 6: Set subscription price
+    // Step 6: Set one-time access price
     await ctx.reply(
-      '💎 Set your monthly subscription price in TON:\n\n' +
+      '💎 Set your one-time access price in TON:\n\n' +
+      'This is a ONE-TIME payment for LIFETIME access.\n\n' +
       'Suggested prices:\n' +
-      '• 5 TON - Basic content\n' +
-      '• 10 TON - Premium content\n' +
-      '• 25 TON - Exclusive/VIP content\n\n' +
+      '• 5 TON - Basic content access\n' +
+      '• 10 TON - Premium content access\n' +
+      '• 25 TON - Exclusive/VIP access\n' +
+      '• 50+ TON - Ultra-premium access\n\n' +
+      'Users pay once and keep access forever!\n\n' +
       'Enter the price (number only):'
     );
 
@@ -461,7 +641,7 @@ export class AdminBot {
       return;
     }
 
-    await this.database.updateChannel(channel.id, { monthly_price_ton: price });
+    await this.database.updateChannel(channel.id, { access_price_ton: price });
 
     // Step 7: Deploy smart contract (user pays via TON Connect)
     await ctx.reply(
@@ -588,14 +768,17 @@ export class AdminBot {
 
       await ctx.reply(
         '✅ Setup Complete!\n\n' +
-        `Your subscription bot is now active for ${channelInfo.title}\n\n` +
-        `📊 Subscription Details:\n` +
-        `• Monthly Price: ${price} TON\n` +
+        `Your paywall is now active for ${channelInfo.title}\n\n` +
+        `📊 Access Details:\n` +
+        `• One-Time Price: ${price} TON\n` +
+        `• Access Type: Lifetime (permanent)\n` +
         `• Contract: ${contractAddress}\n` +
         `• Payment Wallet: ${walletAddress}\n\n` +
-        `Share this with your subscribers:\n` +
+        `🔗 Share your channel invite link:\n` +
+        `Users will be prompted to pay when they request to join.\n\n` +
+        `Or share direct payment link:\n` +
         `👉 t.me/${process.env.PAYMENT_BOT_USERNAME}?start=ch_${channelInfo.id}\n\n` +
-        'Use /analytics to view subscription stats!'
+        'Use /analytics to view member stats and revenue!'
       );
 
     } catch (error) {
@@ -660,26 +843,37 @@ export class AdminBot {
 
   private async showChannelAnalytics(ctx: Context, channelId: number) {
     try {
-      const analytics = await this.analytics.getChannelAnalytics(channelId);
+      // Use new channel_analytics view with one-time access metrics
+      const analytics = await this.database.getChannelAnalytics(channelId);
+
+      if (!analytics) {
+        await ctx.reply('❌ Analytics not available for this channel.');
+        return;
+      }
+
+      // Calculate conversion rate as percentage
+      const conversionRate = analytics.conversion_rate?.toFixed(1) || '0.0';
 
       const message =
-        `📊 Analytics for ${analytics.channelTitle}\n\n` +
-        `📈 Subscribers:\n` +
-        `• Total: ${analytics.totalSubscribers}\n` +
-        `• Active: ${analytics.activeSubscribers}\n` +
-        `• New (30d): ${analytics.newSubscribers}\n` +
-        `• Churned (30d): ${analytics.churnedSubscribers}\n\n` +
-        `💰 Revenue:\n` +
-        `• Total: ${analytics.totalRevenue.toFixed(2)} TON\n` +
-        `• This Month: ${analytics.monthlyRevenue.toFixed(2)} TON\n` +
-        `• Average per User: ${analytics.arpu.toFixed(2)} TON\n\n` +
+        `📊 Channel Analytics\n\n` +
+        `📺 ${analytics.title}\n` +
+        `💰 Access Price: ${analytics.access_price_ton} TON (one-time)\n\n` +
+        `👥 Members:\n` +
+        `• Total Members: ${analytics.total_members}\n` +
+        `• Paid Members: ${analytics.paid_members}\n` +
+        `• Pending Requests: ${analytics.pending_requests}\n\n` +
+        `💎 Revenue:\n` +
+        `• Lifetime Revenue: ${analytics.total_revenue_ton.toFixed(2)} TON\n` +
+        `• Average per Member: ${analytics.paid_members > 0 ? (analytics.total_revenue_ton / analytics.paid_members).toFixed(2) : '0.00'} TON\n\n` +
+        `📈 Conversion:\n` +
+        `• Conversion Rate: ${conversionRate}%\n\n` +
         `📅 Updated: ${new Date().toLocaleDateString()}`;
 
       await ctx.reply(message, {
         reply_markup: {
           inline_keyboard: [
             [{ text: '🔄 Refresh', callback_data: `analytics_${channelId}` }],
-            [{ text: '📥 Export CSV', callback_data: `export_${channelId}` }]
+            [{ text: '📥 Export Data', callback_data: `export_${channelId}` }]
           ]
         }
       });
@@ -701,7 +895,8 @@ export class AdminBot {
       await ctx.reply(
         `⚙️ Manage ${channel.title}\n\n` +
         `Status: ${channel.is_active ? '✅ Active' : '⚠️ Inactive'}\n` +
-        `Price: ${channel.monthly_price_ton} TON\n` +
+        `Access Price: ${channel.access_price_ton} TON (one-time, lifetime)\n` +
+        `Type: ${channel.channel_type || 'private'}\n` +
         `Contract: ${channel.subscription_contract_address || 'Not deployed'}\n`,
         {
           reply_markup: {

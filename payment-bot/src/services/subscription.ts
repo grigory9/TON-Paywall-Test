@@ -1,37 +1,49 @@
-// Subscription management service
+// Access Purchase management service (formerly Subscription)
+// Updated for one-time lifetime access model
 import { Pool } from 'pg';
-import { Subscription } from '../../../shared/types';
+import { AccessPurchase } from '../../../shared/types';
+
+// Legacy type alias for backward compatibility
+type Subscription = AccessPurchase;
 
 export class SubscriptionService {
   constructor(private db: Pool) {}
 
+  /**
+   * Check if user has purchased access to channel
+   * Updated for one-time access model
+   */
   async checkSubscription(
     subscriberId: number,
     channelId: number
-  ): Promise<Subscription | null> {
+  ): Promise<AccessPurchase | null> {
     const result = await this.db.query(
-      'SELECT * FROM subscriptions WHERE subscriber_id = $1 AND channel_id = $2',
+      'SELECT * FROM access_purchases WHERE subscriber_id = $1 AND channel_id = $2',
       [subscriberId, channelId]
     );
     return result.rows[0] || null;
   }
 
-  async getSubscriptionById(subscriptionId: number): Promise<Subscription | null> {
+  async getSubscriptionById(purchaseId: number): Promise<AccessPurchase | null> {
     const result = await this.db.query(
-      'SELECT * FROM subscriptions WHERE id = $1',
-      [subscriptionId]
+      'SELECT * FROM access_purchases WHERE id = $1',
+      [purchaseId]
     );
     return result.rows[0] || null;
   }
 
+  /**
+   * Create or update access purchase
+   * No expiry - lifetime access!
+   */
   async createOrUpdateSubscription(
     subscriberId: number,
     channelId: number,
     amount: number
-  ): Promise<Subscription> {
+  ): Promise<AccessPurchase> {
     const result = await this.db.query(
-      `INSERT INTO subscriptions (subscriber_id, channel_id, status, amount_ton)
-       VALUES ($1, $2, 'pending', $3)
+      `INSERT INTO access_purchases (subscriber_id, channel_id, status, amount_ton, purchase_type)
+       VALUES ($1, $2, 'pending', $3, 'lifetime')
        ON CONFLICT (subscriber_id, channel_id)
        DO UPDATE SET status = 'pending', amount_ton = $3, updated_at = NOW()
        RETURNING *`,
@@ -40,77 +52,88 @@ export class SubscriptionService {
     return result.rows[0];
   }
 
-  async activateSubscription(subscriptionId: number, transactionHash?: string): Promise<void> {
+  /**
+   * Grant lifetime access (no expiry!)
+   * Updated for one-time access model
+   */
+  async activateSubscription(purchaseId: number, transactionHash?: string): Promise<void> {
     await this.db.query('BEGIN');
 
     try {
-      // Update subscription status
+      // Update access purchase status (NO expiry - lifetime!)
       await this.db.query(
-        `UPDATE subscriptions
+        `UPDATE access_purchases
          SET status = 'active',
-             starts_at = NOW(),
-             expires_at = NOW() + INTERVAL '30 days',
+             approved_at = NOW(),
              transaction_hash = $2,
+             purchase_type = 'lifetime',
              updated_at = NOW()
          WHERE id = $1`,
-        [subscriptionId, transactionHash]
+        [purchaseId, transactionHash]
       );
 
       // Create payment record
       await this.db.query(
         `INSERT INTO payments (subscription_id, transaction_hash, amount_ton, status, confirmed_at)
-         VALUES ($1, $2, (SELECT amount_ton FROM subscriptions WHERE id = $1), 'confirmed', NOW())
+         VALUES ($1, $2, (SELECT amount_ton FROM access_purchases WHERE id = $1), 'confirmed', NOW())
          ON CONFLICT (transaction_hash) DO NOTHING`,
-        [subscriptionId, transactionHash]
+        [purchaseId, transactionHash]
       );
 
       await this.db.query('COMMIT');
 
-      console.log(`Subscription ${subscriptionId} activated`);
+      console.log(`Access purchase ${purchaseId} activated with lifetime access`);
     } catch (error) {
       await this.db.query('ROLLBACK');
       throw error;
     }
   }
 
-  async getUserActiveSubscriptions(subscriberId: number): Promise<Subscription[]> {
+  /**
+   * Get user's active access purchases (lifetime access)
+   * No expiry check needed!
+   */
+  async getUserActiveSubscriptions(subscriberId: number): Promise<AccessPurchase[]> {
     const result = await this.db.query(
-      `SELECT s.*, c.title, c.username, c.monthly_price_ton
-       FROM subscriptions s
-       JOIN channels c ON s.channel_id = c.id
-       WHERE s.subscriber_id = $1 AND s.status = 'active'
-       ORDER BY s.expires_at DESC`,
+      `SELECT ap.*, c.title, c.username, c.access_price_ton
+       FROM access_purchases ap
+       JOIN protected_channels c ON ap.channel_id = c.id
+       WHERE ap.subscriber_id = $1 AND ap.status = 'active' AND NOT ap.access_revoked
+       ORDER BY ap.created_at DESC`,
       [subscriberId]
     );
     return result.rows;
   }
 
+  /**
+   * Get active member count for channel
+   * Updated for one-time access model
+   */
   async getActiveSubscriberCount(channelId: number): Promise<number> {
     const result = await this.db.query(
-      'SELECT COUNT(*) as count FROM subscriptions WHERE channel_id = $1 AND status = $2 AND expires_at > NOW()',
+      'SELECT COUNT(*) as count FROM access_purchases WHERE channel_id = $1 AND status = $2 AND NOT access_revoked',
       [channelId, 'active']
     );
     return parseInt(result.rows[0].count);
   }
 
-  async expireOldSubscriptions(): Promise<number> {
-    const result = await this.db.query(
-      `UPDATE subscriptions
-       SET status = 'expired', updated_at = NOW()
-       WHERE status = 'active' AND expires_at < NOW()
-       RETURNING id`
-    );
-    return result.rows.length;
-  }
+  // ============================================================================
+  // REMOVED: expireOldSubscriptions()
+  // One-time access model has no expiry - lifetime access!
+  // ============================================================================
 
-  async getPendingSubscriptions(): Promise<Subscription[]> {
+  /**
+   * Get pending access purchases
+   * Updated for new table names
+   */
+  async getPendingSubscriptions(): Promise<AccessPurchase[]> {
     const result = await this.db.query(
-      `SELECT s.*, c.subscription_contract_address, c.monthly_price_ton, sub.telegram_id
-       FROM subscriptions s
-       JOIN channels c ON s.channel_id = c.id
-       JOIN subscribers sub ON s.subscriber_id = sub.id
-       WHERE s.status = 'pending'
-       AND s.created_at > NOW() - INTERVAL '1 hour'`
+      `SELECT ap.*, c.subscription_contract_address, c.access_price_ton, sub.telegram_id
+       FROM access_purchases ap
+       JOIN protected_channels c ON ap.channel_id = c.id
+       JOIN subscribers sub ON ap.subscriber_id = sub.id
+       WHERE ap.status = 'pending'
+       AND ap.created_at > NOW() - INTERVAL '1 hour'`
     );
     return result.rows;
   }

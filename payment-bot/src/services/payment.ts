@@ -1,5 +1,6 @@
 // Payment monitoring and processing service
 import { Pool } from 'pg';
+import { Bot } from 'grammy';
 import { createTonService } from '../../../shared/ton-client';
 
 // Callback function type for sending notifications
@@ -7,14 +8,16 @@ type NotificationCallback = (userId: number, message: string, options?: any) => 
 
 export class PaymentService {
   private db: Pool;
+  private bot?: Bot; // Reference to bot for approving join requests
   private tonService: ReturnType<typeof createTonService>;
   private monitoringInterval: NodeJS.Timeout | null = null;
   private checkInProgress: boolean = false;
   private lastSuccessfulCheck: number = Date.now();
   private sendNotification?: NotificationCallback;
 
-  constructor(db: Pool, sendNotification?: NotificationCallback) {
+  constructor(db: Pool, sendNotification?: NotificationCallback, bot?: Bot) {
     this.db = db;
+    this.bot = bot;
     this.sendNotification = sendNotification;
     const network = (process.env.TON_NETWORK || 'testnet') as 'mainnet' | 'testnet';
     this.tonService = createTonService(network);
@@ -67,38 +70,42 @@ export class PaymentService {
 
   private async checkPendingPayments() {
     try {
-      // Get all pending subscriptions (parameterized query)
-      const pendingSubs = await this.db.query(
-        `SELECT s.*, c.subscription_contract_address, c.monthly_price_ton, sub.telegram_id, sub.wallet_address
-         FROM subscriptions s
-         JOIN channels c ON s.channel_id = c.id
-         JOIN subscribers sub ON s.subscriber_id = sub.id
-         WHERE s.status = $1
-         AND s.created_at > NOW() - INTERVAL '24 hours'
-         ORDER BY s.created_at DESC
+      // Get all pending access purchases (updated for new table names)
+      const pendingPurchases = await this.db.query(
+        `SELECT ap.*, c.subscription_contract_address, c.access_price_ton, c.telegram_id as channel_telegram_id,
+                sub.telegram_id, sub.wallet_address, c.title
+         FROM access_purchases ap
+         JOIN protected_channels c ON ap.channel_id = c.id
+         JOIN subscribers sub ON ap.subscriber_id = sub.id
+         WHERE ap.status = $1
+         AND ap.created_at > NOW() - INTERVAL '24 hours'
+         ORDER BY ap.created_at DESC
          LIMIT $2`,
         ['pending', 100]
       );
 
-      console.log(`Checking ${pendingSubs.rows.length} pending subscriptions`);
+      console.log(`Checking ${pendingPurchases.rows.length} pending access purchases`);
 
-      for (const sub of pendingSubs.rows) {
-        await this.checkSubscriptionPayment(sub);
+      for (const purchase of pendingPurchases.rows) {
+        await this.checkAccessPayment(purchase);
       }
 
-      // Also expire old subscriptions
-      await this.expireOldSubscriptions();
+      // Note: We no longer expire purchases - lifetime access model
     } catch (error) {
       console.error('Error checking pending payments:', error);
     }
   }
 
-  private async checkSubscriptionPayment(subscription: any) {
+  /**
+   * Check if payment has been made for an access purchase
+   * Updated for one-time access model
+   */
+  private async checkAccessPayment(purchase: any) {
     try {
-      const contractAddress = subscription.subscription_contract_address;
+      const contractAddress = purchase.subscription_contract_address;
 
       if (!contractAddress) {
-        console.warn(`Subscription ${subscription.id} has no contract address`);
+        console.warn(`Access purchase ${purchase.id} has no contract address`);
         return;
       }
 
@@ -110,80 +117,78 @@ export class PaymentService {
       }
 
       // Verify payment transaction on blockchain
-      const sinceTimestamp = Math.floor(new Date(subscription.created_at).getTime() / 1000);
+      const sinceTimestamp = Math.floor(new Date(purchase.created_at).getTime() / 1000);
       const paymentResult = await this.tonService.verifyPayment(
         contractAddress,
-        subscription.monthly_price_ton,
+        purchase.access_price_ton,
         sinceTimestamp
       );
 
       if (paymentResult.found) {
-        console.log(`Payment found for subscription ${subscription.id}:`, paymentResult);
+        console.log(`✅ Payment found for access purchase ${purchase.id}:`, paymentResult);
 
-        // Activate subscription with transaction details
-        await this.activateSubscription(
-          subscription.id,
+        // Grant access and approve join request
+        await this.grantAccess(
+          purchase.id,
+          purchase.telegram_id,
+          purchase.channel_telegram_id,
           paymentResult.txHash!,
           paymentResult.fromAddress!,
           paymentResult.amount!,
           contractAddress
         );
 
-        console.log(`Subscription ${subscription.id} activated for user ${subscription.telegram_id}`);
+        console.log(`✅ Access granted for user ${purchase.telegram_id} to channel ${purchase.title}`);
 
         // Send confirmation notification to user
         if (this.sendNotification) {
           try {
-            // Get subscription details with updated info
-            const updatedSub = await this.db.query(
-              `SELECT s.*, c.title, c.username, c.monthly_price_ton
-               FROM subscriptions s
-               JOIN channels c ON s.channel_id = c.id
-               WHERE s.id = $1`,
-              [subscription.id]
-            );
+            // Get channel invite link for private channels
+            const channelUrl = purchase.invite_link ||
+                              (purchase.username ? `https://t.me/${purchase.username}` : 'https://t.me/');
 
-            if (updatedSub.rows.length > 0) {
-              const sub = updatedSub.rows[0];
-              const expiryDate = new Date(sub.expires_at).toLocaleDateString('en-US', {
-                year: 'numeric',
-                month: 'long',
-                day: 'numeric'
-              });
+            // Escape special MarkdownV2 characters in dynamic values
+            const escapedTitle = String(purchase.title || 'the channel').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+            const escapedAmount = String(purchase.access_price_ton).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 
-              await this.sendNotification(
-                subscription.telegram_id,
-                `✅ *Payment Confirmed!*\n\n` +
-                `Your subscription to *${sub.title}* is now active\\.\n\n` +
-                `💎 Amount: ${sub.monthly_price_ton} TON\n` +
-                `📅 Expires: ${expiryDate}\n` +
-                `🔗 Access: @${sub.username}\n\n` +
-                `Click the channel link above to access your subscription\\!`,
-                {
-                  parse_mode: 'MarkdownV2',
-                  reply_markup: {
-                    inline_keyboard: [
-                      [{ text: '📺 Open Channel', url: `https://t.me/${sub.username}` }],
-                      [{ text: '📊 My Subscriptions', callback_data: 'my_subscriptions' }]
-                    ]
-                  }
+            await this.sendNotification(
+              purchase.telegram_id,
+              `✅ *Payment Confirmed\\!*\n\n` +
+              `Your one\\-time payment of ${escapedAmount} TON is confirmed\\.\n\n` +
+              `You now have *permanent access* to *${escapedTitle}*\\!\n\n` +
+              `📱 Click the button below to join the channel\\.\n\n` +
+              `You can leave and rejoin anytime\\!`,
+              {
+                parse_mode: 'MarkdownV2',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '📺 Join Channel', url: channelUrl }]
+                  ]
                 }
-              );
-              console.log(`✅ Notification sent to user ${subscription.telegram_id}`);
-            }
+              }
+            );
+            console.log(`✅ Notification sent to user ${purchase.telegram_id} with link: ${channelUrl}`);
           } catch (error) {
-            console.error(`Failed to send notification to user ${subscription.telegram_id}:`, error);
+            console.error(`Failed to send notification to user ${purchase.telegram_id}:`, error);
             // Don't throw - notification failure shouldn't break activation
           }
         }
       }
     } catch (error) {
-      console.error(`Error checking payment for subscription ${subscription.id}:`, error);
+      console.error(`Error checking payment for access purchase ${purchase.id}:`, error);
     }
   }
 
-  private async activateSubscription(
-    subscriptionId: number,
+  /**
+   * Grant permanent access and approve join request
+   * Updated for one-time lifetime access model
+   *
+   * CRITICAL: This approves the Telegram join request, allowing user into channel
+   */
+  private async grantAccess(
+    purchaseId: number,
+    userId: number,
+    channelTelegramId: number,
     transactionHash: string,
     fromAddress: string,
     amount: number,
@@ -192,28 +197,29 @@ export class PaymentService {
     await this.db.query('BEGIN');
 
     try {
-      // Check if already activated (idempotency)
+      // Check if already granted (idempotency)
       const existing = await this.db.query(
-        'SELECT status FROM subscriptions WHERE id = $1 FOR UPDATE',
-        [subscriptionId]
+        'SELECT status FROM access_purchases WHERE id = $1 FOR UPDATE',
+        [purchaseId]
       );
 
       if (existing.rows[0]?.status === 'active') {
-        console.log(`Subscription ${subscriptionId} already active`);
+        console.log(`Access purchase ${purchaseId} already active`);
         await this.db.query('ROLLBACK');
         return;
       }
 
-      // Update subscription status with transaction hash
+      // Update access purchase status with transaction hash (no expiry - lifetime!)
       await this.db.query(
-        `UPDATE subscriptions
+        `UPDATE access_purchases
          SET status = 'active',
-             starts_at = NOW(),
-             expires_at = NOW() + INTERVAL '30 days',
+             approved_at = NOW(),
              transaction_hash = $2,
+             amount_ton = $3,
+             purchase_type = 'lifetime',
              updated_at = NOW()
          WHERE id = $1`,
-        [subscriptionId, transactionHash]
+        [purchaseId, transactionHash, amount]
       );
 
       // Create payment record with full details
@@ -221,40 +227,60 @@ export class PaymentService {
         `INSERT INTO payments (subscription_id, transaction_hash, amount_ton, from_address, to_address, status, confirmed_at)
          VALUES ($1, $2, $3, $4, $5, 'confirmed', NOW())
          ON CONFLICT (transaction_hash) DO NOTHING`,
-        [subscriptionId, transactionHash, amount, fromAddress, toAddress]
+        [purchaseId, transactionHash, amount, fromAddress, toAddress]
       );
 
       await this.db.query('COMMIT');
 
-      console.log(`Subscription ${subscriptionId} activated with tx ${transactionHash}`);
+      console.log(`✅ Access purchase ${purchaseId} granted with tx ${transactionHash}`);
+
+      // CRITICAL: Approve Telegram join request
+      if (this.bot) {
+        try {
+          await this.bot.api.approveChatJoinRequest(channelTelegramId, userId);
+          console.log(`✅ Join request approved: user ${userId} → channel ${channelTelegramId}`);
+        } catch (approveError: any) {
+          // Handle Telegram API errors gracefully
+          if (approveError.description?.includes('USER_ALREADY_PARTICIPANT')) {
+            console.log(`User ${userId} already in channel ${channelTelegramId}`);
+          } else if (approveError.description?.includes('HIDE_REQUESTER_MISSING')) {
+            console.log(`Join request already processed for user ${userId}`);
+          } else {
+            console.error('Failed to approve join request:', approveError);
+            // Don't throw - database record is more important
+          }
+        }
+
+        // Clean up pending join request
+        try {
+          await this.db.query(
+            'DELETE FROM pending_join_requests WHERE user_id = $1 AND channel_id = (SELECT id FROM protected_channels WHERE telegram_id = $2)',
+            [userId, channelTelegramId]
+          );
+          console.log(`✅ Pending join request cleaned up for user ${userId}`);
+        } catch (cleanupError) {
+          console.error('Failed to cleanup pending join request:', cleanupError);
+        }
+      } else {
+        console.warn('⚠️ Bot instance not available, cannot approve join request');
+      }
+
     } catch (error) {
       await this.db.query('ROLLBACK');
-      console.error(`Failed to activate subscription ${subscriptionId}:`, error);
+      console.error(`Failed to grant access for purchase ${purchaseId}:`, error);
       throw error;
     }
   }
 
-  private async expireOldSubscriptions() {
-    try {
-      const result = await this.db.query(
-        `UPDATE subscriptions
-         SET status = 'expired', updated_at = NOW()
-         WHERE status = 'active' AND expires_at < NOW()
-         RETURNING id`
-      );
+  // ============================================================================
+  // REMOVED: expireOldSubscriptions()
+  // One-time access model has no expiry - lifetime access!
+  // ============================================================================
 
-      if (result.rows.length > 0) {
-        console.log(`Expired ${result.rows.length} subscriptions`);
-      }
-    } catch (error) {
-      console.error('Error expiring subscriptions:', error);
-    }
-  }
-
-  async getPaymentStatus(subscriptionId: number): Promise<string> {
+  async getPaymentStatus(purchaseId: number): Promise<string> {
     const result = await this.db.query(
-      'SELECT status FROM subscriptions WHERE id = $1',
-      [subscriptionId]
+      'SELECT status FROM access_purchases WHERE id = $1',
+      [purchaseId]
     );
 
     return result.rows[0]?.status || 'unknown';

@@ -1,0 +1,27 @@
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+.env.production
+
+# Database
+*.db
+*.sqlite
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Prisma
+prisma/migrations/
+
+# TON
+*.addr
+*.boc
+temp/

@@ -5,6 +5,7 @@ import { SubscriptionService } from './services/subscription';
 import { PaymentService } from './services/payment';
 import { DatabaseService } from './database/database';
 import { TonConnectService, UserRejectedError, InsufficientFundsError, TransactionError } from './services/tonconnect.service';
+import { ChannelHealthMonitor } from './services/channel-health-monitor';
 import { Address } from '@ton/ton';
 import { beginCell } from '@ton/core';
 
@@ -27,6 +28,7 @@ export class PaymentBot {
   private subscriptionService: SubscriptionService;
   private paymentService: PaymentService;
   private tonConnectService: TonConnectService;
+  private healthMonitor: ChannelHealthMonitor;
 
   constructor(token: string, dbUrl: string) {
     this.bot = new Bot<BotContext>(token);
@@ -36,7 +38,7 @@ export class PaymentBot {
     this.database = new DatabaseService(this.db);
     this.subscriptionService = new SubscriptionService(this.db);
 
-    // Initialize payment service with notification callback
+    // Initialize payment service with notification callback and bot instance
     this.paymentService = new PaymentService(
       this.db,
       async (userId: number, message: string, options?: any) => {
@@ -45,10 +47,14 @@ export class PaymentBot {
         } catch (error) {
           console.error(`Failed to send message to user ${userId}:`, error);
         }
-      }
+      },
+      this.bot as any // Pass bot instance for approving join requests (type cast to avoid session type conflict)
     );
 
     this.tonConnectService = new TonConnectService(this.db);
+
+    // Initialize health monitor
+    this.healthMonitor = new ChannelHealthMonitor(this.bot as any, this.database);
 
     // Setup middleware
     this.bot.use(session({ initial: (): SessionData => ({}) }));
@@ -56,9 +62,11 @@ export class PaymentBot {
     // Setup handlers
     this.setupCommands();
     this.setupCallbacks();
+    this.setupJoinRequestHandler();
 
-    // Start payment monitoring
+    // Start background services
     this.paymentService.startMonitoring();
+    this.healthMonitor.startMonitoring();
 
     // Error handling
     this.bot.catch((err) => {
@@ -133,16 +141,17 @@ export class PaymentBot {
     this.bot.command('help', async (ctx) => {
       await ctx.reply(
         '📚 Help Guide\n\n' +
-        '🔹 Subscribing:\n' +
+        '🔹 Getting Access:\n' +
         '1. Browse channels with /channels\n' +
         '2. Click subscribe on your chosen channel\n' +
         '3. Pay with TON Connect or manual wallet\n' +
         '4. Wait for confirmation (~1 minute)\n' +
-        '5. Access granted!\n\n' +
-        '🔹 Managing Subscriptions:\n' +
-        '• /subscriptions - View all your subscriptions\n' +
-        '• Subscriptions are valid for 30 days\n' +
-        '• Renew before expiry to maintain access\n\n' +
+        '5. Lifetime access granted!\n\n' +
+        '🔹 Managing Access:\n' +
+        '• /subscriptions - View all your active access\n' +
+        '• /resend - Resend channel invite links\n' +
+        '• One-time payment = permanent access\n' +
+        '• Leave and rejoin anytime!\n\n' +
         '🔹 Wallet:\n' +
         '• /wallet - Connect TON wallet for easy payments\n' +
         '• Supports Telegram Wallet, Tonkeeper, MyTonWallet, etc.\n' +
@@ -156,6 +165,65 @@ export class PaymentBot {
     // Wallet command
     this.bot.command('wallet', async (ctx) => {
       await this.showWalletStatus(ctx);
+    });
+
+    // Resend access links command
+    this.bot.command('resend', async (ctx) => {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+
+      try {
+        // Get all active access purchases for this user
+        const result = await this.database.db.query(
+          `SELECT ap.id, ap.channel_id, c.title, c.invite_link, c.username, c.access_price_ton
+           FROM access_purchases ap
+           JOIN protected_channels c ON ap.channel_id = c.id
+           WHERE ap.subscriber_id = (SELECT id FROM subscribers WHERE telegram_id = $1)
+           AND ap.status = 'active'`,
+          [userId]
+        );
+
+        if (result.rows.length === 0) {
+          await ctx.reply('❌ No active access purchases found.\n\nPurchase access to a channel first!');
+          return;
+        }
+
+        await ctx.reply(`📤 Sending access links for ${result.rows.length} channel(s)...`);
+
+        // Send access link for each channel
+        for (const purchase of result.rows) {
+          const channelUrl = purchase.invite_link ||
+                            (purchase.username ? `https://t.me/${purchase.username}` : 'https://t.me/');
+
+          // Escape special MarkdownV2 characters in dynamic values
+          const escapedTitle = String(purchase.title || 'the channel').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+          const escapedAmount = String(purchase.access_price_ton).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+
+          await ctx.reply(
+            `✅ *Payment Confirmed\\!*\n\n` +
+            `Your one\\-time payment of ${escapedAmount} TON is confirmed\\.\n\n` +
+            `You now have *permanent access* to *${escapedTitle}*\\!\n\n` +
+            `📱 Click the button below to join the channel\\.\n\n` +
+            `You can leave and rejoin anytime\\!`,
+            {
+              parse_mode: 'MarkdownV2',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '📺 Join Channel', url: channelUrl }]
+                ]
+              }
+            }
+          );
+
+          // Small delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        await ctx.reply('✅ All access links sent!');
+      } catch (error) {
+        console.error('Error in /resend command:', error);
+        await ctx.reply('❌ Error sending access links. Please try again later.');
+      }
     });
   }
 
@@ -199,9 +267,28 @@ export class PaymentBot {
 
       if (subscription.status === 'active') {
         const channel = await this.database.getChannel(subscription.channel_id);
+
+        // Use invite_link for private channels, username for public channels
+        const channelUrl = channel?.invite_link ||
+                          (channel?.username ? `https://t.me/${channel.username}` : 'https://t.me/');
+
+        // Escape special MarkdownV2 characters in dynamic values
+        const escapedTitle = String(channel?.title || 'the channel').replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+
         await ctx.reply(
-          '✅ Payment confirmed! Your subscription is now active.\n\n' +
-          `Access your channel: https://t.me/${channel?.username || ''}`
+          `✅ *Payment Confirmed\\!*\n\n` +
+          `Your one\\-time payment is confirmed\\.\n\n` +
+          `You now have *permanent access* to *${escapedTitle}*\\!\n\n` +
+          `📱 Click the button below to join the channel\\.\n\n` +
+          `You can leave and rejoin anytime\\!`,
+          {
+            parse_mode: 'MarkdownV2',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '📺 Join Channel', url: channelUrl }]
+              ]
+            }
+          }
         );
       } else {
         await ctx.reply(
@@ -248,6 +335,123 @@ export class PaymentBot {
     });
   }
 
+  /**
+   * Setup handler for Telegram chat join requests
+   * CRITICAL: This is the core of the one-time access model
+   *
+   * WORKFLOW:
+   * 1. User clicks invite link to private channel
+   * 2. Telegram creates join request (not auto-approved)
+   * 3. Bot receives chat_join_request event
+   * 4. Bot checks if user already paid
+   * 5. If paid: auto-approve, if not: send payment instructions
+   *
+   * SECURITY: Bot must be admin with "Invite Users via Link" permission
+   */
+  private setupJoinRequestHandler() {
+    this.bot.on('chat_join_request', async (ctx) => {
+      const request = ctx.chatJoinRequest;
+      const userId = request.from.id;
+      const chatId = request.chat.id;
+
+      console.log(`📥 Join request: user ${userId} → channel ${chatId}`);
+
+      try {
+        // Check if channel uses our paywall system
+        const channel = await this.database.getChannelByTelegramId(chatId);
+
+        if (!channel) {
+          console.log(`⚠️ Join request for non-paywall channel: ${chatId}`);
+          return; // Not our channel, ignore
+        }
+
+        if (!channel.is_active) {
+          console.log(`⚠️ Join request for inactive channel: ${channel.title}`);
+          await this.bot.api.sendMessage(
+            userId,
+            '⚠️ This channel is temporarily inactive. Please try again later.'
+          );
+          return;
+        }
+
+        console.log(`✓ Join request for paywall channel: ${channel.title}`);
+
+        // Check if user already has access
+        const hasAccess = await this.database.hasChannelAccess(userId, channel.id);
+
+        if (hasAccess) {
+          // User already paid - auto-approve
+          console.log(`✓ User ${userId} has existing access, auto-approving`);
+
+          try {
+            await this.bot.api.approveChatJoinRequest(chatId, userId);
+            await this.bot.api.sendMessage(
+              userId,
+              `✅ Welcome back to ${channel.title}!\n\n` +
+              'You already have lifetime access to this channel.'
+            );
+          } catch (approveError: any) {
+            // Handle Telegram API errors
+            if (approveError.description?.includes('USER_ALREADY_PARTICIPANT')) {
+              console.log(`User ${userId} already in channel`);
+            } else {
+              console.error('Failed to approve join request:', approveError);
+            }
+          }
+
+          return;
+        }
+
+        // User doesn't have access - save pending request and send payment instructions
+        console.log(`→ User ${userId} needs to pay, saving pending request`);
+        await this.database.savePendingJoinRequest(userId, channel.id);
+
+        // Send payment instructions
+        await this.bot.api.sendMessage(
+          userId,
+          `💎 **${channel.title}**\n\n` +
+          `Price: **${channel.access_price_ton} TON** (one-time payment)\n\n` +
+          `Pay once, access forever! Click below to proceed:`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '💳 Pay with TON Connect',
+                    callback_data: `pay_${channel.id}`
+                  }
+                ],
+                [
+                  {
+                    text: 'ℹ️ What is TON?',
+                    url: 'https://ton.org'
+                  }
+                ]
+              ]
+            }
+          }
+        );
+
+        console.log(`✓ Payment instructions sent to user ${userId} for channel ${channel.title}`);
+
+      } catch (error) {
+        console.error('❌ Error handling join request:', error);
+        // Don't throw - we don't want to crash bot on individual join request errors
+        try {
+          await this.bot.api.sendMessage(
+            userId,
+            '❌ An error occurred. Please try again or contact support.'
+          );
+        } catch (notifyError) {
+          console.error('Failed to notify user of error:', notifyError);
+        }
+      }
+    });
+
+    console.log('✓ Join request handler registered');
+  }
+
   private async handleChannelSubscription(ctx: Context, channelTelegramId: number) {
     // Find channel in database
     const channel = await this.database.getChannelByTelegramId(channelTelegramId);
@@ -273,24 +477,24 @@ export class PaymentBot {
 
     if (existingSub && existingSub.status === 'active') {
       await ctx.reply(
-        `✅ You already have an active subscription to ${channel.title}!\n\n` +
-        `Expires: ${new Date(existingSub.expires_at!).toLocaleDateString()}\n\n` +
-        `Click here to access: https://t.me/${channel.username}`
+        `✅ You already have lifetime access to ${channel.title}!\n\n` +
+        `Access Type: Permanent\n\n` +
+        `Click here to join: https://t.me/${channel.username}`
       );
       return;
     }
 
-    // Show subscription offer
+    // Show one-time access offer
     await ctx.reply(
       `📺 ${channel.title}\n\n` +
-      `💎 Price: ${channel.monthly_price_ton} TON/month\n` +
+      `💎 Price: ${channel.access_price_ton} TON (one-time)\n` +
       `✅ Instant access after payment\n` +
-      `🔄 Cancel anytime\n\n` +
-      'Ready to subscribe?',
+      `♾️ Lifetime access - no expiry!\n\n` +
+      'Ready to purchase access?',
       {
         reply_markup: {
           inline_keyboard: [
-            [{ text: `💳 Pay ${channel.monthly_price_ton} TON`, callback_data: `pay_${channel.id}` }],
+            [{ text: `💳 Pay ${channel.access_price_ton} TON`, callback_data: `pay_${channel.id}` }],
             [{ text: '❌ Cancel', callback_data: 'cancel' }]
           ]
         }
@@ -312,7 +516,7 @@ export class PaymentBot {
     for (const channel of channels) {
       const subscriberCount = await this.subscriptionService.getActiveSubscriberCount(channel.id);
       message += `🔹 ${channel.title}\n`;
-      message += `   💎 ${channel.monthly_price_ton} TON/month\n`;
+      message += `   💎 ${channel.access_price_ton} TON/month\n`;
       message += `   👥 ${subscriberCount} subscribers\n\n`;
 
       keyboard.push([{
@@ -353,15 +557,11 @@ export class PaymentBot {
       const channel = await this.database.getChannel(sub.channel_id);
       if (!channel) continue;
 
-      const daysLeft = Math.ceil(
-        (new Date(sub.expires_at!).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
-      );
-
       message += `📺 ${channel.title}\n`;
-      message += `   💎 ${channel.monthly_price_ton} TON/month\n`;
-      message += `   📅 Expires: ${new Date(sub.expires_at!).toLocaleDateString()}\n`;
-      message += `   ⏱ ${daysLeft} days left\n`;
-      message += `   🔗 Access: @${channel.username}\n\n`;
+      message += `   💎 ${channel.access_price_ton} TON (one-time)\n`;
+      message += `   ✅ Access Type: Lifetime\n`;
+      message += `   ♾️ Never expires\n`;
+      message += `   🔗 Channel: @${channel.username}\n\n`;
     }
 
     await ctx.reply(message);
@@ -377,14 +577,14 @@ export class PaymentBot {
 
     await ctx.reply(
       `📺 Subscribe to ${channel.title}\n\n` +
-      `💎 Price: ${channel.monthly_price_ton} TON\n` +
+      `💎 Price: ${channel.access_price_ton} TON\n` +
       `📅 Duration: 30 days\n` +
       `✅ Auto-renewal: Disabled (manual renewal)\n\n` +
       'Ready to proceed?',
       {
         reply_markup: {
           inline_keyboard: [
-            [{ text: `💳 Pay ${channel.monthly_price_ton} TON`, callback_data: `pay_${channel.id}` }],
+            [{ text: `💳 Pay ${channel.access_price_ton} TON`, callback_data: `pay_${channel.id}` }],
             [{ text: '❌ Cancel', callback_data: 'cancel' }]
           ]
         }
@@ -419,13 +619,13 @@ export class PaymentBot {
     const subscription = await this.subscriptionService.createOrUpdateSubscription(
       subscriber.id,
       channel.id,
-      channel.monthly_price_ton
+      channel.access_price_ton
     );
 
     if (ctx.session) {
       ctx.session.pendingPayment = {
         channelId: channel.id,
-        amount: channel.monthly_price_ton,
+        amount: channel.access_price_ton,
         contractAddress: channel.subscription_contract_address
       };
     }
@@ -439,7 +639,7 @@ export class PaymentBot {
     // If wallet connected, offer TON Connect payment (recommended)
     if (walletStatus.connected) {
       keyboard.push([{
-        text: `💳 Pay ${channel.monthly_price_ton} TON with ${walletStatus.wallet?.name || 'Connected Wallet'}`,
+        text: `💳 Pay ${channel.access_price_ton} TON with ${walletStatus.wallet?.name || 'Connected Wallet'}`,
         callback_data: `tonconnect_pay_${channel.id}`
       }]);
     } else {
@@ -452,7 +652,7 @@ export class PaymentBot {
     // Always offer manual payment option (Tonkeeper deep link)
     const paymentUrl = this.generateTonPaymentUrl(
       channel.subscription_contract_address,
-      channel.monthly_price_ton,
+      channel.access_price_ton,
       subscription.id
     );
     keyboard.push([{
@@ -468,7 +668,7 @@ export class PaymentBot {
 
     await ctx.reply(
       `💳 Payment for ${channel.title}\n\n` +
-      `Amount: ${channel.monthly_price_ton} TON\n` +
+      `Amount: ${channel.access_price_ton} TON\n` +
       `Contract: \`${channel.subscription_contract_address}\`\n\n` +
       `Choose payment method:\n` +
       (walletStatus.connected
@@ -516,22 +716,22 @@ export class PaymentBot {
     const subscription = await this.subscriptionService.createOrUpdateSubscription(
       subscriber.id,
       channel.id,
-      channel.monthly_price_ton
+      channel.access_price_ton
     );
 
     const paymentUrl = this.generateTonPaymentUrl(
       channel.subscription_contract_address,
-      channel.monthly_price_ton,
+      channel.access_price_ton,
       subscription.id
     );
 
     await ctx.reply(
       `💎 Manual Payment Instructions\n\n` +
-      `Amount: ${channel.monthly_price_ton} TON\n` +
+      `Amount: ${channel.access_price_ton} TON\n` +
       `To: \`${channel.subscription_contract_address}\`\n` +
       `Comment: \`sub_${subscription.id}\`\n\n` +
       `1. Open your TON wallet (Tonkeeper, MyTonWallet, etc.)\n` +
-      `2. Send exactly ${channel.monthly_price_ton} TON to the address above\n` +
+      `2. Send exactly ${channel.access_price_ton} TON to the address above\n` +
       `3. Include the comment in your transaction\n` +
       `4. Wait ~1 minute for blockchain confirmation\n\n` +
       `⚠️ Important:\n` +
@@ -791,16 +991,16 @@ export class PaymentBot {
       const subscription = await this.subscriptionService.createOrUpdateSubscription(
         subscriber.id,
         channel.id,
-        channel.monthly_price_ton
+        channel.access_price_ton
       );
 
       // Prepare transaction
-      const amountNano = (channel.monthly_price_ton * 1e9).toString();
+      const amountNano = (channel.access_price_ton * 1e9).toString();
       const comment = `sub_${subscription.id}`;
 
       await ctx.reply(
         `⏳ Preparing transaction...\n\n` +
-        `Amount: ${channel.monthly_price_ton} TON\n` +
+        `Amount: ${channel.access_price_ton} TON\n` +
         `To: ${channel.title}\n\n` +
         `Please confirm the transaction in your wallet app.`
       );
@@ -909,13 +1109,20 @@ export class PaymentBot {
   }
 
   async start() {
-    await this.bot.start();
+    await this.bot.start({
+      allowed_updates: [
+        'message',
+        'callback_query',
+        'chat_join_request'  // CRITICAL: Required to receive join requests for private channels
+      ]
+    });
     console.log('✅ Payment bot started');
   }
 
   stop() {
     this.bot.stop();
     this.paymentService.stopMonitoring();
+    this.healthMonitor.stopMonitoring();
     this.db.end();
     console.log('⏹ Payment bot stopped');
   }
