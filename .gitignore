@@ -25,3 +25,6 @@ prisma/migrations/
 *.addr
 *.boc
 temp/
+
+# Deployment cache (contains sensitive wallet mnemonics)
+.deploy-cache
